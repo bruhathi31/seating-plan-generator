@@ -1,126 +1,89 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import random
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.dialects.postgresql import UUID
+import uuid
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend access
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql+asyncpg://user:password@localhost/seating_db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-class SeatingPlanner:
-    def __init__(self, guests, groups, tables_config):
-        """
-        Initialize the seating planner.
-        
-        Args:
-            guests (list): List of guest names
-            groups (list): List of groups, where each group is a list of guests
-            tables_config (list): List of table capacities
-        """
-        self.guests = guests
-        self.groups = groups
-        self.tables_config = tables_config
-        
-    def validate_input(self):
-        """Validate that the input configuration is feasible."""
-        # Check if we have enough seats
-        total_capacity = sum(self.tables_config)
-        if len(self.guests) > total_capacity:
-            return False, f"Not enough seats. Need {len(self.guests)} seats but only have {total_capacity}."
-        
-        # Check if any group is larger than the largest table
-        max_table_size = max(self.tables_config)
-        for group in self.groups:
-            if len(group) > max_table_size:
-                return False, f"Group {group} has {len(group)} people but largest table fits {max_table_size}."
-        
-        return True, "Configuration is valid."
-    
-    def generate_plan(self):
-        """Generate a seating plan based on the constraints."""
-        # First validate the input
-        valid, message = self.validate_input()
-        if not valid:
-            return {"error": message}
-        
-        # Initialize tables
-        tables = [[] for _ in self.tables_config]
-        
-        # First, try to place groups together
-        for group in sorted(self.groups, key=len, reverse=True):
-            placed = False
-            
-            # Try to place the group at a table with enough space
-            for i, table in enumerate(tables):
-                if len(table) + len(group) <= self.tables_config[i]:
-                    tables[i].extend(group)
-                    placed = True
-                    break
-            
-            # If we couldn't place the group together, we'll need to split them
-            if not placed:
-                # For simplicity, we'll just add them individually
-                for person in group:
-                    if person not in [p for t in tables for p in t]:  # Avoid duplicates
-                        placed_person = False
-                        for i, table in enumerate(tables):
-                            if len(table) < self.tables_config[i]:
-                                tables[i].append(person)
-                                placed_person = True
-                                break
-                        if not placed_person:
-                            return {"error": f"Could not place {person}. Algorithm needs improvement."}
-        
-        # Place remaining guests
-        unassigned = [g for g in self.guests if g not in [p for t in tables for p in t]]
-        for person in unassigned:
-            placed = False
-            for i, table in enumerate(tables):
-                if len(table) < self.tables_config[i]:
-                    tables[i].append(person)
-                    placed = True
-                    break
-            if not placed:
-                return {"error": f"Could not place {person}. Algorithm needs improvement."}
-        
-        # Format the result
-        result = []
-        for i, table in enumerate(tables):
-            result.append({
-                "table_number": i + 1,
-                "capacity": self.tables_config[i],
-                "guests": table,
-                "empty_seats": self.tables_config[i] - len(table)
-            })
-        
-        return {"seating_plan": result}
+db = SQLAlchemy(app)
 
-@app.route('/api/generate-plan', methods=['POST'])
-def generate_plan():
+# Models
+class Person(db.Model):
+    __tablename__ = 'people'
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = db.Column(db.String, nullable=False)
+    group_id = db.Column(UUID(as_uuid=True), db.ForeignKey('groups.id'), nullable=True)
+
+class Group(db.Model):
+    __tablename__ = 'groups'
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = db.Column(db.String, nullable=False)
+
+class Table(db.Model):
+    __tablename__ = 'tables'
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    capacity = db.Column(db.Integer, nullable=False)
+
+class SeatingPlan(db.Model):
+    __tablename__ = 'seating_plan'
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class SeatingAssignment(db.Model):
+    __tablename__ = 'seating_assignments'
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seating_plan_id = db.Column(UUID(as_uuid=True), db.ForeignKey('seating_plan.id'), nullable=False)
+    person_id = db.Column(UUID(as_uuid=True), db.ForeignKey('people.id'), nullable=False)
+    table_id = db.Column(UUID(as_uuid=True), db.ForeignKey('tables.id'), nullable=False)
+
+# Routes
+@app.route('/add_person', methods=['POST'])
+def add_person():
     data = request.json
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
+    person = Person(name=data['name'], group_id=data.get('group_id'))
+    db.session.add(person)
+    db.session.commit()
+    return jsonify({'message': 'Person added', 'person_id': str(person.id)})
+
+@app.route('/add_group', methods=['POST'])
+def add_group():
+    data = request.json
+    group = Group(name=data['name'])
+    db.session.add(group)
+    db.session.commit()
+    return jsonify({'message': 'Group added', 'group_id': str(group.id)})
+
+@app.route('/generate_seating', methods=['POST'])
+def generate_seating():
+    tables = Table.query.all()
+    people = Person.query.all()
     
-    try:
-        guests = data.get('guests', [])
-        groups = data.get('groups', [])
-        tables_config = data.get('tables_config', [])
+    seating_plan = SeatingPlan()
+    db.session.add(seating_plan)
+    db.session.flush()
+    
+    assignments = []
+    table_index = 0
+    for person in people:
+        table = tables[table_index]
+        assignment = SeatingAssignment(seating_plan_id=seating_plan.id, person_id=person.id, table_id=table.id)
+        assignments.append(assignment)
         
-        # Validate inputs
-        if not guests:
-            return jsonify({"error": "No guests provided"}), 400
-        if not tables_config:
-            return jsonify({"error": "No table configuration provided"}), 400
-        
-        # Create planner and generate plan
-        planner = SeatingPlanner(guests, groups, tables_config)
-        result = planner.generate_plan()
-        
-        if "error" in result:
-            return jsonify(result), 400
-        
-        return jsonify(result), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Move to next table when capacity is reached
+        if len([a for a in assignments if a.table_id == table.id]) >= table.capacity:
+            table_index = (table_index + 1) % len(tables)
+    
+    db.session.bulk_save_objects(assignments)
+    db.session.commit()
+    return jsonify({'message': 'Seating plan generated', 'seating_plan_id': str(seating_plan.id)})
+
+@app.route('/get_seating_plan/<plan_id>', methods=['GET'])
+def get_seating_plan(plan_id):
+    assignments = SeatingAssignment.query.filter_by(seating_plan_id=plan_id).all()
+    result = [{'person_id': str(a.person_id), 'table_id': str(a.table_id)} for a in assignments]
+    return jsonify(result)
 
 if __name__ == '__main__':
     app.run(debug=True)
